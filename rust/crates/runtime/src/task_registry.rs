@@ -500,4 +500,80 @@ mod tests {
         let error = result.expect_err("missing task should be rejected");
         assert_eq!(error, "task not found: missing");
     }
+
+    // ── Stress / long-running stability tests ─────────
+
+    #[test]
+    fn stress_create_many_tasks() {
+        let registry = TaskRegistry::new();
+        let count = 10_000;
+        let mut ids = Vec::with_capacity(count);
+        for i in 0..count {
+            let task = registry.create(&format!("Task {i}"), None);
+            ids.push(task.task_id);
+        }
+        assert_eq!(registry.len(), count);
+        for id in &ids {
+            assert!(registry.get(id).is_some(), "task {id} should exist");
+        }
+    }
+
+    #[test]
+    fn stress_create_remove_cycle() {
+        let registry = TaskRegistry::new();
+        for i in 0..5_000 {
+            let task = registry.create(&format!("Ephemeral {i}"), None);
+            let removed = registry.remove(&task.task_id);
+            assert!(removed.is_some());
+        }
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn stress_append_large_output() {
+        let registry = TaskRegistry::new();
+        let task = registry.create("Output beast", None);
+        // Append 10_000 lines of output.
+        for i in 0..10_000 {
+            registry
+                .append_output(&task.task_id, &format!("line {i}\n"))
+                .expect("append should succeed");
+        }
+        let output = registry.output(&task.task_id).expect("output should exist");
+        assert_eq!(output.lines().count(), 10_000);
+    }
+
+    #[test]
+    fn stress_many_messages_on_task() {
+        let registry = TaskRegistry::new();
+        let task = registry.create("Chatterbox", None);
+        for i in 0..10_000 {
+            registry
+                .update(&task.task_id, &format!("Message {i}"))
+                .expect("update should succeed");
+        }
+        let fetched = registry.get(&task.task_id).expect("task should exist");
+        assert_eq!(fetched.messages.len(), 10_000);
+    }
+
+    #[test]
+    fn stress_assign_team_to_many_tasks() {
+        let registry = TaskRegistry::new();
+        let mut ids = Vec::new();
+        for i in 0..1_000 {
+            let task = registry.create(&format!("Team task {i}"), None);
+            ids.push(task.task_id);
+        }
+        for id in &ids {
+            registry
+                .assign_team(id, "team_stress")
+                .expect("assign should succeed");
+        }
+        let tasks = registry.list(None);
+        let assigned = tasks
+            .iter()
+            .filter(|t| t.team_id.as_deref() == Some("team_stress"))
+            .count();
+        assert_eq!(assigned, 1_000);
+    }
 }

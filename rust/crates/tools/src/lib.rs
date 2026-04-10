@@ -1016,6 +1016,29 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
+            name: "TeamGet",
+            description: "Get the status and details of a team by ID, including its tasks.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "team_id": { "type": "string" }
+                },
+                "required": ["team_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "TeamList",
+            description: "List all teams and their current status.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
             name: "CronCreate",
             description: "Create a scheduled recurring task.",
             input_schema: json!({
@@ -1248,6 +1271,8 @@ fn execute_tool_with_enforcer(
             .and_then(run_worker_observe_completion),
         "TeamCreate" => from_value::<TeamCreateInput>(input).and_then(run_team_create),
         "TeamDelete" => from_value::<TeamDeleteInput>(input).and_then(run_team_delete),
+        "TeamGet" => from_value::<TeamIdInput>(input).and_then(run_team_get),
+        "TeamList" => run_team_list(),
         "CronCreate" => from_value::<CronCreateInput>(input).and_then(run_cron_create),
         "CronDelete" => from_value::<CronDeleteInput>(input).and_then(run_cron_delete),
         "CronList" => run_cron_list(input.clone()),
@@ -1519,16 +1544,24 @@ fn run_worker_observe_completion(input: WorkerObserveCompletionInput) -> Result<
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
-    let task_ids: Vec<String> = input
-        .tasks
-        .iter()
-        .filter_map(|t| t.get("task_id").and_then(|v| v.as_str()).map(str::to_owned))
-        .collect();
-    let team = global_team_registry().create(&input.name, task_ids);
-    // Register team assignment on each task
-    for task_id in &team.task_ids {
-        let _ = global_task_registry().assign_team(task_id, &team.team_id);
+    // Create tasks from prompts first, collect their IDs.
+    let mut task_ids = Vec::with_capacity(input.tasks.len());
+    for t in &input.tasks {
+        let task = global_task_registry().create(&t.prompt, t.description.as_deref());
+        task_ids.push(task.task_id.clone());
     }
+
+    let team = global_team_registry()
+        .create(&input.name, task_ids)
+        .map_err(|e| e.to_string())?;
+
+    // Register team assignment on each task — propagate errors.
+    for task_id in &team.task_ids {
+        global_task_registry()
+            .assign_team(task_id, &team.team_id)
+            .map_err(|e| e)?;
+    }
+
     to_pretty_json(json!({
         "team_id": team.team_id,
         "name": team.name,
@@ -1541,15 +1574,76 @@ fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_team_delete(input: TeamDeleteInput) -> Result<String, String> {
-    match global_team_registry().delete(&input.team_id) {
-        Ok(team) => to_pretty_json(json!({
-            "team_id": team.team_id,
-            "name": team.name,
-            "status": team.status,
-            "message": "Team deleted"
-        })),
-        Err(e) => Err(e),
+    let team = global_team_registry()
+        .delete(&input.team_id)
+        .map_err(|e| e.to_string())?;
+
+    // Stop all running tasks in the team.
+    let mut tasks_stopped = 0u64;
+    let mut task_errors: Vec<String> = Vec::new();
+    for task_id in &team.task_ids {
+        match global_task_registry().stop(task_id) {
+            Ok(_) => tasks_stopped += 1,
+            Err(e) => task_errors.push(format!("{task_id}: {e}")),
+        }
     }
+
+    to_pretty_json(json!({
+        "team_id": team.team_id,
+        "name": team.name,
+        "status": team.status,
+        "tasks_stopped": tasks_stopped,
+        "task_errors": task_errors,
+        "message": "Team deleted"
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_team_get(input: TeamIdInput) -> Result<String, String> {
+    let team = global_team_registry()
+        .get(&input.team_id)
+        .ok_or_else(|| format!("team not found: {}", input.team_id))?;
+
+    let tasks: Vec<Value> = team
+        .task_ids
+        .iter()
+        .filter_map(|id| {
+            global_task_registry().get(id).map(|t| {
+                json!({
+                    "task_id": t.task_id,
+                    "status": t.status.to_string(),
+                    "prompt": t.prompt
+                })
+            })
+        })
+        .collect();
+
+    to_pretty_json(json!({
+        "team_id": team.team_id,
+        "name": team.name,
+        "status": team.status,
+        "created_at": team.created_at,
+        "updated_at": team.updated_at,
+        "task_count": team.task_ids.len(),
+        "tasks": tasks
+    }))
+}
+
+fn run_team_list() -> Result<String, String> {
+    let teams = global_team_registry().list();
+    let summary: Vec<Value> = teams
+        .iter()
+        .map(|t| {
+            json!({
+                "team_id": t.team_id,
+                "name": t.name,
+                "status": t.status,
+                "task_count": t.task_ids.len(),
+                "created_at": t.created_at
+            })
+        })
+        .collect();
+    to_pretty_json(json!({ "teams": summary }))
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2278,11 +2372,23 @@ const fn default_auto_recover_prompt_misdelivery() -> bool {
 #[derive(Debug, Deserialize)]
 struct TeamCreateInput {
     name: String,
-    tasks: Vec<Value>,
+    tasks: Vec<TeamTaskInput>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamTaskInput {
+    prompt: String,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TeamDeleteInput {
+    team_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamIdInput {
     team_id: String,
 }
 
@@ -8595,6 +8701,176 @@ printf 'pwsh:%s' "$1"
                 self.body
             )
             .into_bytes()
+        }
+    }
+
+    // ── Team tool tests ──────────────────────────────────
+
+    #[test]
+    fn team_create_creates_tasks_and_team() {
+        let _lock = env_lock().lock().unwrap();
+        let result = execute_tool(
+            "TeamCreate",
+            &json!({
+                "name": "Alpha",
+                "tasks": [
+                    { "prompt": "Do task 1", "description": "First" },
+                    { "prompt": "Do task 2" }
+                ]
+            }),
+        )
+        .expect("TeamCreate should succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(parsed["name"], "Alpha");
+        assert_eq!(parsed["task_count"], 2);
+        assert_eq!(parsed["status"], "created");
+        assert!(parsed["team_id"].as_str().unwrap().starts_with("team_"));
+    }
+
+    #[test]
+    fn team_create_rejects_empty_name() {
+        let _lock = env_lock().lock().unwrap();
+        let result = execute_tool(
+            "TeamCreate",
+            &json!({
+                "name": "",
+                "tasks": [{ "prompt": "x" }]
+            }),
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn team_create_rejects_empty_tasks() {
+        let _lock = env_lock().lock().unwrap();
+        let result = execute_tool(
+            "TeamCreate",
+            &json!({
+                "name": "NoTasks",
+                "tasks": []
+            }),
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("at least one task"));
+    }
+
+    #[test]
+    fn team_delete_stops_running_tasks() {
+        let _lock = env_lock().lock().unwrap();
+        let create_result = execute_tool(
+            "TeamCreate",
+            &json!({
+                "name": "Deletable",
+                "tasks": [{ "prompt": "Work" }]
+            }),
+        )
+        .expect("TeamCreate should succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&create_result).expect("json");
+        let team_id = parsed["team_id"].as_str().expect("team_id");
+
+        let delete_result = execute_tool("TeamDelete", &json!({ "team_id": team_id }))
+            .expect("TeamDelete should succeed");
+        let del_parsed: serde_json::Value = serde_json::from_str(&delete_result).expect("json");
+        assert_eq!(del_parsed["status"], "deleted");
+        assert_eq!(del_parsed["tasks_stopped"], 1);
+    }
+
+    #[test]
+    fn team_get_returns_team_with_tasks() {
+        let _lock = env_lock().lock().unwrap();
+        let create_result = execute_tool(
+            "TeamCreate",
+            &json!({
+                "name": "Queryable",
+                "tasks": [
+                    { "prompt": "Task A" },
+                    { "prompt": "Task B" }
+                ]
+            }),
+        )
+        .expect("TeamCreate should succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&create_result).expect("json");
+        let team_id = parsed["team_id"].as_str().expect("team_id");
+
+        let get_result = execute_tool("TeamGet", &json!({ "team_id": team_id }))
+            .expect("TeamGet should succeed");
+        let get_parsed: serde_json::Value = serde_json::from_str(&get_result).expect("json");
+        assert_eq!(get_parsed["name"], "Queryable");
+        assert_eq!(get_parsed["task_count"], 2);
+        assert_eq!(get_parsed["tasks"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn team_get_rejects_missing_team() {
+        let _lock = env_lock().lock().unwrap();
+        let result = execute_tool("TeamGet", &json!({ "team_id": "ghost_team" }));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("team not found"));
+    }
+
+    #[test]
+    fn team_list_returns_all_teams() {
+        let _lock = env_lock().lock().unwrap();
+        execute_tool(
+            "TeamCreate",
+            &json!({
+                "name": "ListA",
+                "tasks": [{ "prompt": "A" }]
+            }),
+        )
+        .expect("create A");
+        execute_tool(
+            "TeamCreate",
+            &json!({
+                "name": "ListB",
+                "tasks": [{ "prompt": "B" }]
+            }),
+        )
+        .expect("create B");
+
+        let result = execute_tool("TeamList", &json!({})).expect("TeamList should succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("json");
+        let teams = parsed["teams"].as_array().expect("teams array");
+        assert!(teams.len() >= 2);
+    }
+
+    #[test]
+    fn team_delete_rejects_already_deleted() {
+        let _lock = env_lock().lock().unwrap();
+        let create_result = execute_tool(
+            "TeamCreate",
+            &json!({
+                "name": "DoubleDelete",
+                "tasks": [{ "prompt": "x" }]
+            }),
+        )
+        .expect("TeamCreate should succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&create_result).expect("json");
+        let team_id = parsed["team_id"].as_str().expect("team_id");
+
+        execute_tool("TeamDelete", &json!({ "team_id": team_id })).expect("first delete");
+        let second = execute_tool("TeamDelete", &json!({ "team_id": team_id }));
+        assert!(second.is_err());
+        assert!(second.unwrap_err().contains("already deleted"));
+    }
+
+    #[test]
+    fn stress_team_create_delete_many_teams_via_tool() {
+        let _lock = env_lock().lock().unwrap();
+        for i in 0..200 {
+            let create_result = execute_tool(
+                "TeamCreate",
+                &json!({
+                    "name": format!("Stress {i}"),
+                    "tasks": [{ "prompt": format!("Work {i}") }]
+                }),
+            )
+            .expect("create should succeed");
+            let parsed: serde_json::Value = serde_json::from_str(&create_result).expect("json");
+            let team_id = parsed["team_id"].as_str().expect("team_id");
+            execute_tool("TeamDelete", &json!({ "team_id": team_id }))
+                .expect("delete should succeed");
         }
     }
 }
